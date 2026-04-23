@@ -706,6 +706,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
+        reasoning_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
@@ -746,6 +747,7 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id=session_id,
             platform="api_server",
             stream_delta_callback=stream_delta_callback,
+            reasoning_callback=reasoning_callback,
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
@@ -916,6 +918,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if stream:
             import queue as _q
             _stream_q: _q.Queue = _q.Queue()
+            _reasoning_q: _q.Queue = _q.Queue()
 
             def _on_delta(delta):
                 # Filter out None — the agent fires stream_delta_callback(None)
@@ -927,6 +930,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 # completion via agent_task.done() instead.
                 if delta is not None:
                     _stream_q.put(delta)
+
+            def _on_reasoning(text: str):
+                """Forward reasoning deltas to the reasoning queue.
+
+                These are emitted as ``delta.reasoning_content`` chunks in the
+                SSE stream, matching the OpenAI chat-completions spec for
+                reasoning/thinking models.
+                """
+                if text:
+                    _reasoning_q.put(text)
 
             def _on_tool_progress(event_type, name, preview, args, **kwargs):
                 """Send tool progress as a separate SSE event.
@@ -968,6 +981,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
+                reasoning_callback=_on_reasoning,
                 tool_progress_callback=_on_tool_progress,
                 agent_ref=agent_ref,
             ))
@@ -975,6 +989,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return await self._write_sse_chat_completion(
                 request, completion_id, model_name, created, _stream_q,
                 agent_task, agent_ref, session_id=session_id,
+                reasoning_q=_reasoning_q,
             )
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
@@ -1011,6 +1026,12 @@ class APIServerAdapter(BasePlatformAdapter):
         if not final_response:
             final_response = result.get("error", "(No response generated)")
 
+        # Build the assistant message with optional reasoning_content
+        assistant_msg: Dict[str, Any] = {"role": "assistant", "content": final_response}
+        last_reasoning = result.get("last_reasoning")
+        if last_reasoning:
+            assistant_msg["reasoning_content"] = last_reasoning
+
         response_data = {
             "id": completion_id,
             "object": "chat.completion",
@@ -1019,10 +1040,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "choices": [
                 {
                     "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": final_response,
-                    },
+                    "message": assistant_msg,
                     "finish_reason": "stop",
                 }
             ],
@@ -1038,6 +1056,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,
         created: int, stream_q, agent_task, agent_ref=None, session_id: str = None,
+        reasoning_q=None,
     ) -> "web.StreamResponse":
         """Write real streaming SSE from agent's stream_delta_callback queue.
 
@@ -1099,6 +1118,29 @@ class APIServerAdapter(BasePlatformAdapter):
                     await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
                 return time.monotonic()
 
+            # Helper — emit reasoning deltas as delta.reasoning_content chunks.
+            async def _emit_reasoning(text: str):
+                reasoning_chunk = {
+                    "id": completion_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{"index": 0, "delta": {"reasoning_content": text}, "finish_reason": None}],
+                }
+                await response.write(f"data: {json.dumps(reasoning_chunk)}\n\n".encode())
+                return time.monotonic()
+
+            def _drain_reasoning():
+                """Drain all pending reasoning items from the reasoning queue."""
+                if reasoning_q is None:
+                    return
+                while True:
+                    try:
+                        reasoning_text = reasoning_q.get_nowait()
+                        # We need to run the async emit from sync context;
+                        # collect texts and emit them via the loop below.
+                        yield reasoning_text
+                    except _q.Empty:
+                        break
+
             # Stream content chunks as they arrive from the agent
             loop = asyncio.get_running_loop()
             while True:
@@ -1106,7 +1148,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     delta = await loop.run_in_executor(None, lambda: stream_q.get(timeout=0.5))
                 except _q.Empty:
                     if agent_task.done():
-                        # Drain any remaining items
+                        # Drain any remaining reasoning items first, then
+                        # remaining content items, before closing the stream.
+                        for r_text in _drain_reasoning():
+                            last_activity = await _emit_reasoning(r_text)
                         while True:
                             try:
                                 delta = stream_q.get_nowait()
@@ -1116,15 +1161,27 @@ class APIServerAdapter(BasePlatformAdapter):
                             except _q.Empty:
                                 break
                         break
+                    # Also flush reasoning while waiting for content
+                    for r_text in _drain_reasoning():
+                        last_activity = await _emit_reasoning(r_text)
                     if time.monotonic() - last_activity >= CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS:
                         await response.write(b": keepalive\n\n")
                         last_activity = time.monotonic()
                     continue
 
+                # Flush reasoning before emitting this content delta
+                for r_text in _drain_reasoning():
+                    last_activity = await _emit_reasoning(r_text)
+
                 if delta is None:  # End of stream sentinel
                     break
 
                 last_activity = await _emit(delta)
+
+            # Final reasoning flush after stream sentinel (agent may have
+            # fired reasoning deltas right up to the last moment)
+            for r_text in _drain_reasoning():
+                last_activity = await _emit_reasoning(r_text)
 
             # Get usage from completed agent
             usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
@@ -1182,6 +1239,7 @@ class APIServerAdapter(BasePlatformAdapter):
         conversation: Optional[str],
         store: bool,
         session_id: str,
+        reasoning_q=None,
     ) -> "web.StreamResponse":
         """Write an SSE stream for POST /v1/responses (OpenAI Responses API).
 
@@ -1439,13 +1497,38 @@ class APIServerAdapter(BasePlatformAdapter):
                     await _emit_text_delta(it)
                 # Other types (non-string, non-tuple) are silently dropped.
 
+            def _drain_reasoning_queue():
+                """Drain and yield all pending reasoning texts."""
+                if reasoning_q is None:
+                    return
+                while True:
+                    try:
+                        yield reasoning_q.get_nowait()
+                    except _q.Empty:
+                        break
+
+            async def _emit_reasoning_summary_delta(text: str) -> None:
+                """Emit a reasoning_summary.delta event for the Responses API."""
+                # Reasoning summary items use their own item_id and output_index
+                nonlocal output_index
+                await _write_event("response.reasoning_summary.delta", {
+                    "type": "response.reasoning_summary.delta",
+                    "item_id": message_item_id,
+                    "output_index": message_output_index if message_output_index is not None else 0,
+                    "content_index": 0,
+                    "delta": text,
+                })
+
             loop = asyncio.get_running_loop()
             while True:
                 try:
                     item = await loop.run_in_executor(None, lambda: stream_q.get(timeout=0.5))
                 except _q.Empty:
                     if agent_task.done():
-                        # Drain remaining
+                        # Drain remaining reasoning first, then content items
+                        for r_text in _drain_reasoning_queue():
+                            await _emit_reasoning_summary_delta(r_text)
+                            last_activity = time.monotonic()
                         while True:
                             try:
                                 item = stream_q.get_nowait()
@@ -1456,15 +1539,29 @@ class APIServerAdapter(BasePlatformAdapter):
                             except _q.Empty:
                                 break
                         break
+                    # Also flush reasoning while waiting for content
+                    for r_text in _drain_reasoning_queue():
+                        await _emit_reasoning_summary_delta(r_text)
+                        last_activity = time.monotonic()
                     if time.monotonic() - last_activity >= CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS:
                         await response.write(b": keepalive\n\n")
                         last_activity = time.monotonic()
                     continue
 
+                # Flush reasoning before dispatching content item
+                for r_text in _drain_reasoning_queue():
+                    await _emit_reasoning_summary_delta(r_text)
+                    last_activity = time.monotonic()
+
                 if item is None:  # EOS sentinel
                     break
 
                 await _dispatch(item)
+                last_activity = time.monotonic()
+
+            # Final reasoning flush after stream sentinel
+            for r_text in _drain_reasoning_queue():
+                await _emit_reasoning_summary_delta(r_text)
                 last_activity = time.monotonic()
 
             # Pick up agent result + usage from the completed task
@@ -1700,6 +1797,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # calls in real time.  See _write_sse_responses for details.
             import queue as _q
             _stream_q: _q.Queue = _q.Queue()
+            _reasoning_q: _q.Queue = _q.Queue()
 
             def _on_delta(delta):
                 # None from the agent is a CLI box-close signal, not EOS.
@@ -1707,6 +1805,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 # SSE writer detects completion via agent_task.done().
                 if delta is not None:
                     _stream_q.put(delta)
+
+            def _on_reasoning(text: str):
+                """Forward reasoning deltas for Responses API streaming."""
+                if text:
+                    _reasoning_q.put(text)
 
             def _on_tool_progress(event_type, name, preview, args, **kwargs):
                 """Queue non-start tool progress events if needed in future.
@@ -1741,6 +1844,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
+                reasoning_callback=_on_reasoning,
                 tool_progress_callback=_on_tool_progress,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
@@ -1765,6 +1869,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation=conversation,
                 store=store,
                 session_id=session_id,
+                reasoning_q=_reasoning_q,
             )
 
         async def _compute_response():
@@ -2137,20 +2242,27 @@ class APIServerAdapter(BasePlatformAdapter):
                     "output": msg.get("content", ""),
                 })
 
-        # Final assistant message
+        # Final assistant message — include reasoning if available
         final = result.get("final_response", "")
         if not final:
             final = result.get("error", "(No response generated)")
 
+        content_items: List[Dict[str, Any]] = []
+        last_reasoning = result.get("last_reasoning")
+        if last_reasoning:
+            content_items.append({
+                "type": "reasoning_summary",
+                "text": last_reasoning,
+            })
+        content_items.append({
+            "type": "output_text",
+            "text": final,
+        })
+
         items.append({
             "type": "message",
             "role": "assistant",
-            "content": [
-                {
-                    "type": "output_text",
-                    "text": final,
-                }
-            ],
+            "content": content_items,
         })
         return items
 
@@ -2165,6 +2277,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
+        reasoning_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
@@ -2188,6 +2301,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=ephemeral_system_prompt,
                 session_id=session_id,
                 stream_delta_callback=stream_delta_callback,
+                reasoning_callback=reasoning_callback,
                 tool_progress_callback=tool_progress_callback,
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
@@ -2304,6 +2418,20 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
+        # Wire reasoning_callback so thinking deltas flow through as reasoning events
+        def _reasoning_cb(text: str) -> None:
+            if not text:
+                return
+            try:
+                loop.call_soon_threadsafe(q.put_nowait, {
+                    "event": "reasoning.delta",
+                    "run_id": run_id,
+                    "timestamp": time.time(),
+                    "delta": text,
+                })
+            except Exception:
+                pass
+
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
 
@@ -2360,6 +2488,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     ephemeral_system_prompt=ephemeral_system_prompt,
                     session_id=session_id,
                     stream_delta_callback=_text_cb,
+                    reasoning_callback=_reasoning_cb,
                     tool_progress_callback=event_cb,
                 )
                 def _run_sync():
@@ -2377,13 +2506,17 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
-                q.put_nowait({
+                completed_event = {
                     "event": "run.completed",
                     "run_id": run_id,
                     "timestamp": time.time(),
                     "output": final_response,
                     "usage": usage,
-                })
+                }
+                last_reasoning = result.get("last_reasoning") if isinstance(result, dict) else None
+                if last_reasoning:
+                    completed_event["reasoning"] = last_reasoning
+                q.put_nowait(completed_event)
             except Exception as exc:
                 logger.exception("[api_server] run %s failed", run_id)
                 try:
