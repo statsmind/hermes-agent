@@ -5551,6 +5551,7 @@ class HermesCLI:
             base_url=result.base_url or self.base_url or "",
             api_key=result.api_key or self.api_key or "",
             model_info=mi,
+            custom_providers=custom_provs
         )
         if ctx:
             _cprint(f"    Context: {ctx:,} tokens")
